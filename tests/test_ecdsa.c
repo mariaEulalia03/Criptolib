@@ -1,0 +1,209 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "ecdsa.h"
+
+#define COLOR_RESET  "\033[0m"
+#define COLOR_GREEN  "\033[32m"
+#define COLOR_RED    "\033[31m"
+#define COLOR_CYAN   "\033[36m"
+#define COLOR_YELLOW "\033[33m"
+#define COLOR_BOLD   "\033[1m"
+
+static int g_tests_passed = 0;
+static int g_tests_failed = 0;
+
+static void assert_condition(int condition, const char *test_name) {
+    if (condition) {
+        printf("  [%sPASS%s] %s\n", COLOR_GREEN, COLOR_RESET, test_name);
+        g_tests_passed++;
+    } else {
+        printf("  [%sFAIL%s] %s\n", COLOR_RED, COLOR_RESET, test_name);
+        g_tests_failed++;
+    }
+}
+
+static void print_hex_label(const char *label, const BigInt *val) {
+    char hex[256];
+    bigint_to_hex(val, hex, sizeof(hex));
+    printf("    %s: 0x%s\n", label, hex);
+}
+
+/* ========================================================================= */
+/*                          FASE 1 Y 2: CONTROL DE CURVA                     */
+/* ========================================================================= */
+
+void test_fase1_y_2_arimetica(const ECCurve *curve) {
+    printf("\n%s=== FASE 1 Y 2: Inicializacion y Aritmetica de Puntos P-256 ===%s\n", COLOR_CYAN, COLOR_RESET);
+
+    /* 1. Verificar que el punto base G pertenece a la curva */
+    int g_on_curve = ecdsa_point_is_on_curve(curve, &curve->G);
+    assert_condition(g_on_curve, "Punto generador base G pertenece a Curve P-256");
+
+    /* 2. Verificar que [1]G == G */
+    BigInt one;
+    bigint_set_u32(&one, 1);
+    ECPoint oneG;
+    ec_scalar_mul(curve, one, &curve->G, &oneG);
+    int is_1g_correct = (!oneG.is_infinity &&
+                         bigint_cmp(&oneG.x, &curve->G.x) == 0 &&
+                         bigint_cmp(&oneG.y, &curve->G.y) == 0);
+    assert_condition(is_1g_correct, "Multiplicacion escalar [1]G coincide exactamente con G");
+
+    /* 3. Verificar que 2G calculado con ec_point_double coincide con vector oficial */
+    ECPoint twoG;
+    ec_point_double(curve, &curve->G, &twoG);
+
+    BigInt expected_2Gx, expected_2Gy;
+    bigint_from_hex(&expected_2Gx, "7CF27B188D034F7E8A52380304B51AC3C08969E277F21B35A60B48FC47669978");
+    bigint_from_hex(&expected_2Gy, "7775510DB8ED040293D9AC69F7430DBBA7DADE63CE982299E04B79D227873D1");
+
+    int is_2g_correct = (!twoG.is_infinity &&
+                         bigint_cmp(&twoG.x, &expected_2Gx) == 0 &&
+                         bigint_cmp(&twoG.y, &expected_2Gy) == 0);
+    assert_condition(is_2g_correct, "Duplicacion de punto ec_point_double(G) coincide bit a bit con 2G oficial");
+
+    /* 4. Verificar que [2]G con scalar_mul coincide con ec_point_double */
+    BigInt two;
+    bigint_set_u32(&two, 2);
+    ECPoint twoG_scalar;
+    ec_scalar_mul(curve, two, &curve->G, &twoG_scalar);
+    int is_scalar_double_equiv = (bigint_cmp(&twoG.x, &twoG_scalar.x) == 0 &&
+                                  bigint_cmp(&twoG.y, &twoG_scalar.y) == 0);
+    assert_condition(is_scalar_double_equiv, "Equivalencia entre ec_point_double(G) y ec_scalar_mul(2, G)");
+
+    /* 5. Verificar que [n]G == O (Punto en el infinito) */
+    ECPoint nG;
+    ec_scalar_mul(curve, curve->n, &curve->G, &nG);
+    assert_condition(nG.is_infinity, "Orden primo [n]G resulta en el punto en el infinito (O)");
+}
+
+/* ========================================================================= */
+/*                          FASE 3: VECTORES NIST CAVP                       */
+/* ========================================================================= */
+
+void test_fase3_vectores_cavp(const ECCurve *curve) {
+    printf("\n%s=== FASE 3: Validacion con Vectores Oficiales del NIST CAVP ===%s\n", COLOR_CYAN, COLOR_RESET);
+
+    /*
+     * Vector Oficial NIST CAVP (FIPS 186-4/5 ECDSA P-256 SHA-256)
+     */
+    const char *cavp_d_hex = "C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721";
+    const char *cavp_k_hex = "A6FE30047443EE12746441364D3E5B191435A942F84369992999F3565FB05A1F";
+    const char *cavp_e_hex = "1AAB2E8797DBEFE22B675EB3FB917A85380C0DBE2EAF834E6D06058467BE7786";
+    const char *cavp_expected_r = "614B38169454720149B2C66C185AAB68563CDB9C2220A858ED8318A354AFCAD4";
+    const char *cavp_expected_s = "36AE7E05B4016D5DF650C22F3CE0D3EB84111A6021B5C79FEC56C2E64CA8FFEF";
+
+    BigInt d, k, e, exp_r, exp_s;
+    bigint_from_hex(&d, cavp_d_hex);
+    bigint_from_hex(&k, cavp_k_hex);
+    bigint_from_hex(&e, cavp_e_hex);
+    bigint_from_hex(&exp_r, cavp_expected_r);
+    bigint_from_hex(&exp_s, cavp_expected_s);
+
+    /* 1. Generacion de Clave Publica Q = [d]G */
+    ECPoint pub_Q;
+    int keygen_ok = ecdsa_keygen(curve, d, &pub_Q);
+    assert_condition(keygen_ok, "Generacion y validacion de clave publica NIST CAVP Q = [d]G");
+
+    /* 2. Firma determinista con k fijo */
+    ECDSASignature sig;
+    int sign_ok = ecdsa_sign_with_k(curve, d, e, k, &sig);
+    assert_condition(sign_ok, "Generacion de firma con k fijo (NIST CAVP)");
+
+    int r_match = (bigint_cmp(&sig.r, &exp_r) == 0);
+    int s_match = (bigint_cmp(&sig.s, &exp_s) == 0);
+    assert_condition(r_match, "Componente de firma 'r' coincide bit a bit con CAVP");
+    assert_condition(s_match, "Componente de firma 's' coincide bit a bit con CAVP");
+
+    /* 3. Verificacion de la firma oficial */
+    int verify_ok = ecdsa_verify(curve, &pub_Q, e, &sig);
+    assert_condition(verify_ok, "Verificacion ecdsa_verify exitosa con vector CAVP (v == r)");
+}
+
+/* ========================================================================= */
+/*                          FASE 4: INTEGRACION Y CASOS DE PRUEBA REALES     */
+/* ========================================================================= */
+
+void test_fase4_flujo_completo(const ECCurve *curve) {
+    printf("\n%s=== FASE 4: Flujo Completo con Mensaje Real y Pruebas de Seguridad ===%s\n", COLOR_CYAN, COLOR_RESET);
+
+    /* 1. Generacion de Par de Claves Real */
+    BigInt priv_d;
+    ECPoint pub_Q;
+    int kg_ok = ecdsa_generate_keypair(curve, &priv_d, &pub_Q);
+    assert_condition(kg_ok, "Generacion de nuevo par de claves aleatorias (d, Q) mediante CSPRNG");
+
+    print_hex_label("Clave Privada (d)", &priv_d);
+    print_hex_label("Clave Publica (Q.x)", &pub_Q.x);
+    print_hex_label("Clave Publica (Q.y)", &pub_Q.y);
+
+    /* 2. Hash SHA-256 de un Mensaje Real */
+    const char *mensaje_original = "Universidad de Cuenca - Seguridad Informatica - ECDSA CryptoLib 2026";
+    printf("    Mensaje a firmar: \"%s\"\n", mensaje_original);
+
+    uint8_t hash_bytes[32];
+    sha256_hash((const uint8_t *)mensaje_original, strlen(mensaje_original), hash_bytes);
+
+    BigInt hash_e;
+    sha256_to_bigint(hash_bytes, &hash_e);
+    print_hex_label("Hash SHA-256 (e)", &hash_e);
+
+    /* 3. Firma del mensaje con ecdsa_sign */
+    ECDSASignature firma;
+    int sign_ok = ecdsa_sign(curve, priv_d, hash_e, &firma);
+    assert_condition(sign_ok, "Firma digital del mensaje original generada exitosamente");
+    print_hex_label("Firma r", &firma.r);
+    print_hex_label("Firma s", &firma.s);
+
+    /* 4. Verificacion de la firma valida */
+    int verify_valid = ecdsa_verify(curve, &pub_Q, hash_e, &firma);
+    assert_condition(verify_valid, "Verificacion de autenticidad e integridad del mensaje (Aceptada)");
+
+    /* 5. Deteccion de alteraciones en el mensaje (Ataque de Tampering) */
+    const char *mensaje_alterado = "Universidad de Cuenca - Seguridad Informatica - ECDSA CryptoLib 2027";
+    uint8_t hash_alterado_bytes[32];
+    sha256_hash((const uint8_t *)mensaje_alterado, strlen(mensaje_alterado), hash_alterado_bytes);
+    BigInt hash_alterado_e;
+    sha256_to_bigint(hash_alterado_bytes, &hash_alterado_e);
+
+    int verify_tampered = ecdsa_verify(curve, &pub_Q, hash_alterado_e, &firma);
+    assert_condition(!verify_tampered, "Deteccion de manipulacion: mensaje alterado fue RECHAZADO");
+
+    /* 6. Deteccion de firma con clave publica equivocada (Wrong Key Attack) */
+    BigInt wrong_d;
+    ECPoint wrong_pub_Q;
+    ecdsa_generate_keypair(curve, &wrong_d, &wrong_pub_Q);
+    int verify_wrong_key = ecdsa_verify(curve, &wrong_pub_Q, hash_e, &firma);
+    assert_condition(!verify_wrong_key, "Proteccion de identidad: firma verificada con clave ajena fue RECHAZADA");
+
+    /* 7. Deteccion de corrupcion en componentes de la firma (Corrupted Signature) */
+    ECDSASignature firma_corrupta = firma;
+    BigInt one;
+    bigint_set_u32(&one, 1);
+    bigint_add(&firma_corrupta.s, &firma_corrupta.s, &one); /* s corrupto */
+    int verify_corrupted = ecdsa_verify(curve, &pub_Q, hash_e, &firma_corrupta);
+    assert_condition(!verify_corrupted, "Deteccion de firma adulterada (s modificado) fue RECHAZADA");
+}
+
+int main(void) {
+    printf("%s=================================================================%s\n", COLOR_BOLD, COLOR_RESET);
+    printf("%s   CRYPTOLIB: BANCO DE PRUEBAS DE VALIDACION DEL ESTANDAR ECDSA  %s\n", COLOR_BOLD, COLOR_RESET);
+    printf("%s   NIST FIPS PUB 186-5 / NIST SP 800-186 / CURVE P-256 (SECP256R1) %s\n", COLOR_BOLD, COLOR_RESET);
+    printf("%s=================================================================%s\n", COLOR_BOLD, COLOR_RESET);
+
+    ECCurve curve;
+    ec_init_p256(&curve);
+
+    test_fase1_y_2_arimetica(&curve);
+    test_fase3_vectores_cavp(&curve);
+    test_fase4_flujo_completo(&curve);
+
+    printf("\n%s-----------------------------------------------------------------%s\n", COLOR_BOLD, COLOR_RESET);
+    printf("RESUMEN DE PRUEBAS:\n");
+    printf("  Superadas: %s%d%s\n", COLOR_GREEN, g_tests_passed, COLOR_RESET);
+    printf("  Fallidas:  %s%d%s\n", (g_tests_failed > 0 ? COLOR_RED : COLOR_GREEN), g_tests_failed, COLOR_RESET);
+    printf("%s-----------------------------------------------------------------%s\n", COLOR_BOLD, COLOR_RESET);
+
+    return (g_tests_failed == 0) ? 0 : 1;
+}
