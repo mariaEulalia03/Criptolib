@@ -81,6 +81,8 @@ Trabajo SI/
    - $\checkmark$ Detección de componentes adulterados en $(r, s)$.
 - Validaciones endurecidas: coordenadas canónicas de clave pública ($x, y < p$), parámetros de firma en $[1, n-1]$ y rechazo de entradas hexadecimales inválidas o mayores a 640 bits.
 - Pruebas unitarias de SHA-256 (KAT FIPS 180-4) y de la aritmética BigInt.
+- Firma determinista **RFC 6979** con HMAC-SHA256 y multiplicación escalar por **escalera de Montgomery** (intercambio condicional sin ramas por bit).
+- Inversión modular por **Pequeño Teorema de Fermat** para $k^{-1}$ (con verificación de invertibilidad), manteniendo el algoritmo binario de NIST B.2 para las operaciones de campo.
 
 - CLI interactivo `build/ecdsa_cli` para generación de claves, firma y verificación.
 
@@ -113,9 +115,12 @@ Salida esperada:
 === FASE 0: SHA-256 (FIPS 180-4) y Arimetica BigInt (pruebas unitarias) ===
   [PASS] SHA-256 KAT: cadena vacia, "abc", bloque multiple y frase de referencia
   [PASS] SHA-256: procesamiento incremental coincide con sha256_hash
+  [PASS] HMAC-SHA256 KAT 1, 2 y 6 (RFC 4231)
   [PASS] BigInt: suma con acarreo, resta reversible y rechazo de a < b
   [PASS] BigInt: multiplicacion 64x64 y division a = q*b + r
   [PASS] BigInt: inverso modular valido e inexistente (modulo par / mcd > 1)
+  [PASS] BigInt: exponenciacion modular y inverso por Fermat (7^-1 mod 13 = 2)
+  [PASS] BigInt: Fermat rechaza entradas no invertibles (3 mod 9, 2 mod 4)
   [PASS] BigInt: desplazamientos, bytes y prefijo 0x
   [PASS] BigInt: rechazo de hex invalido, vacio y mayor a 640 bits
   [PASS] BigInt: muestreo aleatorio dentro de [1, n-1]
@@ -134,6 +139,11 @@ Salida esperada:
   [PASS] Componente de firma 's' coincide bit a bit con CAVP
   [PASS] Verificacion ecdsa_verify exitosa con vector CAVP (v == r)
 
+=== FASE 3B: Firma determinista RFC 6979 (P-256 / SHA-256) ===
+  [PASS] RFC 6979: (r, s) deterministas coinciden con los vectores "sample" y "test"
+  [PASS] RFC 6979: firma determinista verificada con ecdsa_verify
+  [PASS] RFC 6979: dos firmas del mismo mensaje son identicas
+
 === FASE 4: Flujo Completo con Mensaje Real y Pruebas de Seguridad ===
   [PASS] Generacion de nuevo par de claves aleatorias (d, Q) mediante CSPRNG
   [PASS] Firma digital del mensaje original generada exitosamente
@@ -150,7 +160,7 @@ Salida esperada:
   [PASS] ecdsa_verify rechaza la clave publica en el infinito
 
 -----------------------------------------------------------------
-RESUMEN DE PRUEBAS: Superadas: 48 | Fallidas: 0
+RESUMEN DE PRUEBAS: Superadas: 60 | Fallidas: 0
 -----------------------------------------------------------------
 ```
 

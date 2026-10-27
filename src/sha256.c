@@ -127,3 +127,49 @@ void sha256_hash(const uint8_t *data, size_t len, uint8_t hash[32]) {
 void sha256_to_bigint(const uint8_t hash[32], BigInt *out) {
     bigint_from_bytes(out, hash, 32);
 }
+
+/*
+ * HMAC-SHA256 (RFC 2104 / FIPS 198-1):
+ *   HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m))
+ * Si la clave supera el tamano de bloque (64 bytes) se sustituye por H(K).
+ * Es seguro que 'out' coincida con 'key' o 'data': la clave se copia y los
+ * datos se consumen antes de escribir el resultado.
+ */
+void hmac_sha256(const uint8_t *key, size_t key_len,
+                 const uint8_t *data, size_t data_len,
+                 uint8_t out[32]) {
+    uint8_t key_block[64];
+    uint8_t k_ipad[64];
+    uint8_t k_opad[64];
+    uint8_t inner_hash[32];
+    sha256_ctx ctx;
+
+    memset(key_block, 0, sizeof(key_block));
+    if (key_len > sizeof(key_block)) {
+        sha256_hash(key, key_len, key_block); /* Quedan 32 bytes + ceros */
+    } else {
+        memcpy(key_block, key, key_len);
+    }
+
+    for (int i = 0; i < 64; i++) {
+        k_ipad[i] = (uint8_t)(key_block[i] ^ 0x36);
+        k_opad[i] = (uint8_t)(key_block[i] ^ 0x5c);
+    }
+
+    /* Hash interno: H(K ^ ipad || data) */
+    sha256_init(&ctx);
+    sha256_update(&ctx, k_ipad, sizeof(k_ipad));
+    sha256_update(&ctx, data, data_len);
+    sha256_final(&ctx, inner_hash);
+
+    /* Hash externo: H(K ^ opad || inner_hash) */
+    sha256_init(&ctx);
+    sha256_update(&ctx, k_opad, sizeof(k_opad));
+    sha256_update(&ctx, inner_hash, sizeof(inner_hash));
+    sha256_final(&ctx, out);
+
+    memset(key_block, 0, sizeof(key_block));
+    memset(k_ipad, 0, sizeof(k_ipad));
+    memset(k_opad, 0, sizeof(k_opad));
+    memset(inner_hash, 0, sizeof(inner_hash));
+}

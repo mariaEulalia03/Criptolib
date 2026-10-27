@@ -429,6 +429,87 @@ int bigint_inv_mod(BigInt *res, const BigInt *k, const BigInt *m) {
 }
 
 /*
+ * Intercambio condicional sin ramas: con mask = 0xFFFFFFFF intercambia a y b;
+ * con mask = 0 el contenido queda igual. Evita que el patron de ejecucion
+ * dependa de los bits del escalar o del exponente.
+ */
+static void bigint_cswap(BigInt *a, BigInt *b, uint32_t mask) {
+    for (int i = 0; i < BIGINT_WORDS; i++) {
+        uint32_t t = (a->limbs[i] ^ b->limbs[i]) & mask;
+        a->limbs[i] ^= t;
+        b->limbs[i] ^= t;
+    }
+
+    uint32_t la = (uint32_t)a->len;
+    uint32_t lb = (uint32_t)b->len;
+    uint32_t t = (la ^ lb) & mask;
+    a->len = (int)(la ^ t);
+    b->len = (int)(lb ^ t);
+}
+
+/*
+ * Exponenciacion modular mediante escalera de Montgomery.
+ * Se ejecutan siempre 256 iteraciones (2 multiplicaciones por iteracion),
+ * independientemente del valor del exponente, para no filtrar su longitud
+ * ni la posicion de sus bits. Pensada para exponentes de hasta 256 bits
+ * (p. ej. m - 2 con los primos de P-256).
+ */
+void bigint_exp_mod(BigInt *res, const BigInt *base, const BigInt *exp, const BigInt *m) {
+    BigInt r0, r1;
+
+    if (bigint_is_zero(m)) {
+        bigint_zero(res);
+        return;
+    }
+
+    bigint_set_u32(&r0, 1);
+    bigint_mod(&r1, base, m);
+
+    for (int i = 255; i >= 0; i--) {
+        uint32_t mask = 0U - (uint32_t)bigint_get_bit(exp, i);
+
+        bigint_cswap(&r0, &r1, mask);
+        bigint_mul_mod(&r1, &r0, &r1, m); /* r1 = r0 * r1 */
+        bigint_mul_mod(&r0, &r0, &r0, m); /* r0 = r0^2   */
+        bigint_cswap(&r0, &r1, mask);
+    }
+
+    bigint_copy(res, &r0);
+}
+
+/*
+ * Inverso modular por Pequeno Teorema de Fermat: k^(m-2) mod m.
+ * Valido cuando m es primo (p y n en P-256). Para conservar la semantica de
+ * bigint_inv_mod se verifica que k * res == 1 (mod m); si m es compuesto o
+ * k no es invertible, devuelve 0 y deja res en cero.
+ */
+int bigint_inv_mod_fermat(BigInt *res, const BigInt *k, const BigInt *m) {
+    BigInt two, exp, inv, check;
+
+    if (bigint_is_zero(k) || bigint_is_zero(m)) {
+        bigint_zero(res);
+        return 0;
+    }
+
+    bigint_set_u32(&two, 2);
+    if (bigint_sub(&exp, m, &two) != 0) { /* m < 2 */
+        bigint_zero(res);
+        return 0;
+    }
+
+    bigint_exp_mod(&inv, k, &exp, m);
+
+    bigint_mul_mod(&check, &inv, k, m);
+    if (!bigint_is_one(&check)) {
+        bigint_zero(res);
+        return 0; /* k no invertible modulo m (m no primo) */
+    }
+
+    bigint_copy(res, &inv);
+    return 1;
+}
+
+/*
  * Parseo desde cadena hexadecimal.
  * Devuelve 0 en exito, -1 si la cadena es vacia, contiene un caracter
  * no hexadecimal o excede la capacidad maxima (BIGINT_WORDS * 8 digitos).

@@ -91,6 +91,42 @@ static void test_sha256_kat(void) {
 }
 
 /* ========================================================================= */
+/*                  FASE 0: HMAC-SHA256 (Vectores RFC 4231)                  */
+/* ========================================================================= */
+
+static void test_hmac_sha256_rfc4231(void) {
+    printf("\n%s=== FASE 0: HMAC-SHA256 (RFC 4231) ===%s\n", COLOR_CYAN, COLOR_RESET);
+
+    uint8_t key1[20];
+    uint8_t key6[131];
+    uint8_t mac[32];
+    char hex[65];
+
+    /* Caso 1: clave de 20 bytes 0x0b */
+    memset(key1, 0x0b, sizeof(key1));
+    const char *data1 = "Hi There";
+    hmac_sha256(key1, sizeof(key1), (const uint8_t *)data1, strlen(data1), mac);
+    bytes_to_hex(mac, sizeof(mac), hex);
+    assert_condition(strcmp(hex, "B0344C61D8DB38535CA8AFCEAF0BF12B881DC200C9833DA726E9376C2E32CFF7") == 0,
+                     "HMAC-SHA256 KAT 1 (RFC 4231): clave 0x0b x 20");
+
+    /* Caso 2: clave de 4 bytes "Jefe" */
+    const char *data2 = "what do ya want for nothing?";
+    hmac_sha256((const uint8_t *)"Jefe", 4, (const uint8_t *)data2, strlen(data2), mac);
+    bytes_to_hex(mac, sizeof(mac), hex);
+    assert_condition(strcmp(hex, "5BDCC146BF60754E6A042426089575C75A003F089D2739839DEC58B964EC3843") == 0,
+                     "HMAC-SHA256 KAT 2 (RFC 4231): clave corta \"Jefe\"");
+
+    /* Caso 6: clave de 131 bytes (> bloque) para ejercitar el hash de la clave */
+    memset(key6, 0xaa, sizeof(key6));
+    const char *data6 = "Test Using Larger Than Block-Size Key - Hash Key First";
+    hmac_sha256(key6, sizeof(key6), (const uint8_t *)data6, strlen(data6), mac);
+    bytes_to_hex(mac, sizeof(mac), hex);
+    assert_condition(strcmp(hex, "60E431591EE0B67F0D8A26AACBF5B77F8E0BC6213728C5140546040F0EE37F54") == 0,
+                     "HMAC-SHA256 KAT 6 (RFC 4231): clave mayor a 64 bytes");
+}
+
+/* ========================================================================= */
 /*                    FASE 0: PRUEBAS UNITARIAS DE BigInt                    */
 /* ========================================================================= */
 
@@ -158,6 +194,43 @@ static void test_bigint_unit(const ECCurve *curve) {
     bigint_set_u32(&b, 9);
     assert_condition(bigint_inv_mod(&res, &a, &b) == 0 && bigint_is_zero(&res),
                      "BigInt: inverso modular inexistente devuelve error (mcd > 1)");
+
+    /* Exponenciacion modular por escalera: 2^10 mod 1000 = 24 y 3^7 mod 13 = 3 */
+    BigInt mod1000;
+    bigint_set_u32(&mod1000, 1000);
+    bigint_set_u32(&a, 2);
+    bigint_set_u32(&b, 10);
+    bigint_exp_mod(&res, &a, &b, &mod1000);
+    bigint_to_hex(&res, hex, sizeof(hex));
+    int exp_ok_1 = (strcmp(hex, "18") == 0);
+
+    bigint_set_u32(&a, 3);
+    bigint_set_u32(&b, 7);
+    bigint_set_u32(&mod1000, 13);
+    bigint_exp_mod(&res, &a, &b, &mod1000);
+    bigint_to_hex(&res, hex, sizeof(hex));
+    int exp_ok_2 = (strcmp(hex, "3") == 0);
+    assert_condition(exp_ok_1 && exp_ok_2,
+                     "BigInt: exponenciacion modular 2^10 mod 1000 y 3^7 mod 13");
+
+    /* Inverso por Pequeno Teorema de Fermat: 7^-1 mod 13 = 2 */
+    bigint_set_u32(&a, 7);
+    bigint_set_u32(&b, 13);
+    int fermat_ok = bigint_inv_mod_fermat(&res, &a, &b);
+    bigint_to_hex(&res, hex, sizeof(hex));
+    assert_condition(fermat_ok && strcmp(hex, "2") == 0,
+                     "BigInt: inverso por Fermat 7^-1 mod 13 = 2");
+
+    /* Fermat debe rechazar entradas no invertibles */
+    bigint_set_u32(&a, 3);
+    bigint_set_u32(&b, 9);
+    assert_condition(bigint_inv_mod_fermat(&res, &a, &b) == 0 && bigint_is_zero(&res),
+                     "BigInt: inverso por Fermat rechaza 3 mod 9");
+
+    bigint_set_u32(&a, 2);
+    bigint_set_u32(&b, 4);
+    assert_condition(bigint_inv_mod_fermat(&res, &a, &b) == 0 && bigint_is_zero(&res),
+                     "BigInt: inverso por Fermat rechaza 2 mod 4");
 
     /* Desplazamientos ida y vuelta */
     bigint_set_u32(&a, 1);
@@ -311,6 +384,71 @@ void test_fase3_vectores_cavp(const ECCurve *curve) {
 }
 
 /* ========================================================================= */
+/*              FASE 3B: FIRMA DETERMINISTA RFC 6979 (P-256/SHA-256)         */
+/* ========================================================================= */
+
+static void test_rfc6979(const ECCurve *curve) {
+    printf("\n%s=== FASE 3B: Firma determinista RFC 6979 (P-256 / SHA-256) ===%s\n", COLOR_CYAN, COLOR_RESET);
+
+    /* Clave privada del Apendice A.2.5 de RFC 6979 */
+    BigInt d;
+    bigint_from_hex(&d, "C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721");
+
+    ECPoint pub_Q;
+    ecdsa_keygen(curve, d, &pub_Q);
+
+    struct {
+        const char *msg;
+        const char *r;
+        const char *s;
+    } vectors[] = {
+        {"sample",
+         "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716",
+         "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8"},
+        {"test",
+         "F1ABB023518351CD71D881567B1EA663ED3EFCF6C5132B354F28D3B0B7D38367",
+         "019F4113742A2B14BD25926B49C649155F267E60D3814B4C0CC84250E46F0083"},
+    };
+
+    size_t n_vectors = sizeof(vectors) / sizeof(vectors[0]);
+    for (size_t i = 0; i < n_vectors; i++) {
+        uint8_t hash_bytes[32];
+        BigInt e, expected_r, expected_s;
+        ECDSASignature sig;
+        char name[160];
+
+        sha256_hash((const uint8_t *)vectors[i].msg, strlen(vectors[i].msg), hash_bytes);
+        sha256_to_bigint(hash_bytes, &e);
+        bigint_from_hex(&expected_r, vectors[i].r);
+        bigint_from_hex(&expected_s, vectors[i].s);
+
+        int ok = ecdsa_sign(curve, d, e, &sig);
+
+        /* Se comparan como BigInt: bigint_to_hex no conserva ceros a la izquierda */
+        snprintf(name, sizeof(name),
+                 "RFC 6979: (r, s) deterministas coinciden con el vector \"%s\"", vectors[i].msg);
+        assert_condition(ok &&
+                         bigint_cmp(&sig.r, &expected_r) == 0 &&
+                         bigint_cmp(&sig.s, &expected_s) == 0,
+                         name);
+        assert_condition(ecdsa_verify(curve, &pub_Q, e, &sig),
+                         "RFC 6979: firma determinista verificada con ecdsa_verify");
+    }
+
+    /* La misma entrada debe producir exactamente la misma firma (determinismo) */
+    uint8_t hash_bytes[32];
+    sha256_hash((const uint8_t *)"sample", 6, hash_bytes);
+    BigInt e;
+    sha256_to_bigint(hash_bytes, &e);
+
+    ECDSASignature sig_a, sig_b;
+    ecdsa_sign(curve, d, e, &sig_a);
+    ecdsa_sign(curve, d, e, &sig_b);
+    assert_condition(bigint_cmp(&sig_a.r, &sig_b.r) == 0 && bigint_cmp(&sig_a.s, &sig_b.s) == 0,
+                     "RFC 6979: dos firmas del mismo mensaje son identicas");
+}
+
+/* ========================================================================= */
 /*                          FASE 4: INTEGRACION Y CASOS DE PRUEBA REALES     */
 /* ========================================================================= */
 
@@ -459,9 +597,11 @@ int main(void) {
     ec_init_p256(&curve);
 
     test_sha256_kat();
+    test_hmac_sha256_rfc4231();
     test_bigint_unit(&curve);
     test_fase1_y_2_arimetica(&curve);
     test_fase3_vectores_cavp(&curve);
+    test_rfc6979(&curve);
     test_fase4_flujo_completo(&curve);
     test_validaciones_borde(&curve);
 

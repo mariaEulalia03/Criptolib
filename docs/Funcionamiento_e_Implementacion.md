@@ -2,7 +2,7 @@
 
 **Universidad de Cuenca — Facultad de Ingeniería, Computación**
 **Materia:** Seguridad Informática
-**Autores:** Joseline Banegas, Maria Lojano, Adrian Muñoz
+**Autores:** Joselinne Banegas, Maria Lojano, Adrian Muñoz
 
 Implementación completa en C del **Algoritmo de Firma Digital de Curva Elíptica (ECDSA)** conforme a:
 
@@ -10,8 +10,10 @@ Implementación completa en C del **Algoritmo de Firma Digital de Curva Elíptic
 |---|---|
 | NIST FIPS PUB 186-5 | Generación de claves, firma y verificación (DSS) |
 | NIST SP 800-186 §3.2.1.3 | Parámetros de dominio de la curva P-256 / secp256r1 |
-| NIST FIPS PUB 180-4 | Función resumen SHA-256 |
+| NIST FIPS PUB 180-4 / FIPS 198-1 | SHA-256 y HMAC-SHA256 |
 | NIST FIPS 186-5 Apéndice B.2 | Inverso modular por algoritmo binario extendido |
+| RFC 6979 | Generación determinista del nonce k (firma reproducible) |
+| RFC 4231 | Vectores de prueba de HMAC-SHA256 |
 
 ---
 
@@ -19,13 +21,13 @@ Implementación completa en C del **Algoritmo de Firma Digital de Curva Elíptic
 
 | Archivo | Responsabilidad |
 |---|---|
-| `include/libcrypt.h` | Infraestructura base: aritmética `BigInt`, SHA-256 y CSPRNG |
+| `include/libcrypt.h` | Infraestructura base: aritmética `BigInt`, SHA-256, HMAC y CSPRNG |
 | `include/ecdsa.h` | Tipos `ECPoint`, `ECCurve`, `ECDSASignature` y prototipos ECDSA |
-| `src/bigint.c` | Precisión arbitraria, aritmética modular, inverso modular, entropía |
-| `src/sha256.c` | SHA-256 y conversión _digest_ → `BigInt` |
-| `src/ecdsa.c` | Parámetros P-256, geometría de la curva y primitivas ECDSA |
+| `src/bigint.c` | Precisión arbitraria, aritmética modular, inversos (B.2 y Fermat), entropía |
+| `src/sha256.c` | SHA-256, HMAC-SHA256 y conversión _digest_ → `BigInt` |
+| `src/ecdsa.c` | Parámetros P-256, geometría, escalera de Montgomery y primitivas ECDSA |
 | `src/cli.c` | Herramienta `keygen` / `sign` / `verify` |
-| `tests/test_ecdsa.c` | Banco de pruebas (KAT, CAVP y casos de seguridad) |
+| `tests/test_ecdsa.c` | Banco de pruebas (KAT, RFC 4231, CAVP, RFC 6979 y seguridad) |
 
 ```mermaid
 flowchart LR
@@ -93,19 +95,26 @@ Casos especiales tratados explícitamente:
 
 Las divisiones se implementan como multiplicación por el inverso modular (λ = num · den⁻¹ mod p), evitando divisiones enteras.
 
-### 2.3 Multiplicación escalar
+### 2.3 Multiplicación escalar: escalera de Montgomery
 
-`ec_scalar_mul` implementa __Double-and-Add__ de MSB a LSB:
+`ec_scalar_mul` __no__ usa Double-and-Add condicional: implementa una escalera de Montgomery sobre 256 iteraciones fijas.
 
 ```sh
-acc = O
-for i = bit_length(k)-1 downto 0:
-    if acc != O: acc = 2·acc
-    if bit_i(k) == 1: acc = acc + P
-return acc
+R0 = O ;  R1 = P
+for i = 255 downto 0:
+    cs = bit_i(k)                     # solo como máscara, sin ramas
+    cswap(R0, R1, cs)
+    R1 = R0 + R1
+    R0 = 2 · R0
+    cswap(R0, R1, cs)
+return R0
 ```
 
-## Complejidad O(log k) duplicaciones/adiciones en lugar de O(k) sumas.
+En cada iteración se ejecuta __exactamente__ una adición y una duplicación, sin importar el bit (0 o 1) ni la longitud del escalar; el recorrido es siempre de 256 bits. El intercambio condicional `ec_point_cswap` se hace con máscara `0xFFFFFFFF/0x00000000` sobre las 20 palabras de `BigInt` (no 8: `BIGINT_WORDS = 20`), sobre `len` y sobre `is_infinity`.
+
+Esto elimina las ramas que dependían de los bits del escalar, aunque las operaciones de campo (`ec_point_add`, `ec_point_double`, `bigint_div`) siguen teniendo control de flujo dependiente de los datos, por lo que la propiedad _constant-time_ es parcial (ver sección 9).
+
+---
 
 ## 3. Aritmética BigInt
 
@@ -118,18 +127,25 @@ return acc
 | División | División larga _shift-and-subtract_ bit a bit (resto siempre < b) |
 | Módulo | Resto de la división |
 | `add_mod` / `sub_mod` / `mul_mod` | Operación básica seguida de reducción |
-| Inverso modular | Algoritmo binario extendido de NIST B.2 |
+| Inverso modular (campo) | Algoritmo binario extendido de NIST B.2, requisito módulo impar y mcd = 1 |
+| Inverso modular (secreto) | Pequeño Teorema de Fermat con escalera: k^(m−2) mod m |
+| Exponenciación modular | Escalera de Montgomery de 256 iteraciones (`bigint_exp_mod`) |
+| Intercambio condicional | `bigint_cswap` con máscara, sin ramas |
 | Aleatoriedad | Muestreo por rechazo uniforme en [min, max] |
 
 **Detalles críticos:**
 
-- El algoritmo binario de inversión exige módulo **impar** y mcd(k, m) = 1. Si m es par o si u/v llegan a cero, devuelve error (0) y deja el resultado en cero.
+- `bigint_inv_mod` (B.2) se mantiene como ruta rápida para las operaciones de campo; exige módulo __impar__ y mcd(k, m) = 1, y devuelve error (0) con `res` en cero si no se cumple.
+- `bigint_inv_mod_fermat` calcula k^(m−2) mod m con escalera de 256 iteraciones y __verifica__ que k · res ≡ 1 (mod m). Si m no es primo o k no es invertible devuelve 0, conservando la semántica de la versión binaria. Se usa para k⁻¹ en la firma, donde el inverso depende de un valor secreto.
+- `bigint_exp_mod` ejecuta siempre 2 multiplicaciones modulares por iteración; la máscara de intercambio depende solo del exponente (público: n−2), no de la base.
 - `bigint_from_hex` __rechaza__ cadenas vacías, caracteres no hexadecimales y valores de más de 160 dígitos (640 bits), en vez de truncar en silencio.
-- `bigint_random_range` usa `cryptolib_random_bytes` (`/dev/urandom` en POSIX, `CryptGenRandom` en Windows) y descarta candidatos fuera de rango: distribución uniforme sin sesgo modular.
+- `bigint_random_range` usa `cryptolib_random_bytes` (`/dev/urandom` en POSIX, `CryptGenRandom` en Windows) y descarta candidatos fuera de rango: distribución uniforme sin sesgo modular. Tras RFC 6979 solo se usa para generar claves.
 
 ---
 
-## 4. SHA-256 (FIPS 180-4)
+## 4. Funciones de hash
+
+### 4.1 SHA-256 (FIPS 180-4)
 
 `sha256_init` / `sha256_update` / `sha256_final` implementan el estándar:
 
@@ -139,6 +155,22 @@ return acc
 
 `sha256_to_bigint` interpreta el digest como entero big-endian, que es el valor e usado por ECDSA.
 
+### 4.2 HMAC-SHA256 (RFC 2104 / FIPS 198-1)
+
+```c
+void hmac_sha256(const uint8_t *key, size_t key_len,
+                 const uint8_t *data, size_t data_len,
+                 uint8_t out[32]);
+```
+
+Construcción: HMAC(K, m) = H((K' ⊕ opad) ‖ H((K' ⊕ ipad) ‖ m)), con bloque de 64 bytes. Si la clave supera 64 bytes se sustituye por H(K). La implementación:
+
+- rellena la clave a 64 bytes y construye los pads `0x36` / `0x5c`;
+- tolera *aliasing* (`out` puede ser la misma clave o los mismos datos) porque la clave se copia y los datos se consumen antes de escribir el resultado;
+- borra pads y hash interno al finalizar.
+
+Se valida con los vectores 1, 2 y 6 de **RFC 4231**, incluido el caso de clave de 131 bytes.
+
 ---
 
 ## 5. Algoritmos ECDSA
@@ -146,27 +178,37 @@ return acc
 ### 5.1 Generación de claves (`ecdsa_generate_keypair` / `ecdsa_keygen`)
 
 1. d ∈R [1, n−1] con el CSPRNG del sistema.
-2. Q = [d]G.
+2. Q = [d]G (con la escalera de Montgomery).
 3. Validaciones: Q ≠ O y Q pertenece a la curva (incluyendo coordenadas canónicas).
 
-### 5.2 Firma (`ecdsa_sign`)
+### 5.2 Generación determinista de k (RFC 6979)
+
+`ecdsa_sign` deriva k con HMAC-SHA256 en lugar del CSPRNG, según RFC 6979 §3.2:
+
+- `int2octets(x)`: la clave privada como 32 bytes big-endian.
+- `bits2octets(H(m))`: **reducción módulo n** del hash antes de serializar (el código original del tutorial omitía este paso y divergía del estándar cuando e ≥ n).
+- `V = 0x01…`, `K = 0x00…`; luego `K = HMAC_K(V ‖ 0x00 ‖ d ‖ h)`, `V = HMAC_K(V)`, repitiendo con `0x01`.
+- En cada iteración `V = HMAC_K(V)` y `k = bits2int(V)`; si 1 ≤ k ≤ n−1 y la firma es válida se devuelve. En caso contrario `K = HMAC_K(V ‖ 0x00)` y `V = HMAC_K(V)`.
+- Ciclo acotado a 100 intentos y **borrado seguro** de V, K, buffers y candidato al salir.
+
+Consecuencia: misma clave privada y mismo mensaje ⇒ misma (r, s), lo que permite reproducir vectores oficiales y elimina el riesgo de reutilización accidental de k.
+
+### 5.3 Firma (`ecdsa_sign_with_k`)
 
 Con e = SHA-256(m) interpretado como entero:
 
-1. k ∈R [1, n−1] (hasta 1000 reintentos si r o s resultan nulos).
-2. (x1, y1) = [k]G; si es O, reintentar.
-3. r = x1 mod n; si r = 0, reintentar.
-4. s = k⁻¹ · (e + d·r) mod n; si s = 0, reintentar.
-5. Firma: (r, s).
+1. Validar d y k en [1, n−1].
+2. (x1, y1) = [k]G; si es O, error.
+3. r = x1 mod n; si r = 0, error (el llamador reintenta).
+4. k⁻¹ mediante `bigint_inv_mod_fermat` (k es secreto).
+5. s = k⁻¹ · (e + d·r) mod n; si s = 0, error.
 
-`ecdsa_sign_with_k` expone el mismo cálculo con k explícito, lo que permite reproducir vectores oficiales __NIST CAVP__ de forma determinista.
-
-### 5.3 Verificación (`ecdsa_verify`)
+### 5.4 Verificación (`ecdsa_verify`)
 
 1. Rechazar si r ∉ [1, n−1] o s ∉ [1, n−1].
 2. Rechazar si Q = O o si Q no es un punto canónico de la curva (x, y < p y y² ≡ x³ + a·x + b).
-3. w = s⁻¹ mod n.
-4. u1 = e·w mod n, u2 = r·w mod n.
+3. w = s⁻¹ mod n (algoritmo binario: s es público y la ruta rápida importa).
+4. u1 = e·w mod n, u2 = r·w mod n (las multiplicaciones modulares ya reducen mód n).
 5. X = [u1]G + [u2]Q; si X = O, rechazar.
 6. Aceptar si y solo si Xx mod n = r.
 
@@ -174,8 +216,9 @@ Con e = SHA-256(m) interpretado como entero:
 sequenceDiagram
     participant E as Emisor
     participant R as Receptor
-    E->>E: e = SHA-256(m)
-    E->>E: k aleatorio, r = x([k]G) mod n
+    E->>E: e = SHA-256(m), h = e mod n
+    E->>E: K,V = HMAC-SHA256(RFC 6979)
+    E->>E: k = bits2int(V); r = x([k]G) mod n
     E->>E: s = k^-1 (e + d·r) mod n
     E->>R: (m, r, s)
     R->>R: w = s^-1 mod n
@@ -212,12 +255,18 @@ sequenceDiagram
 
 ### Fase 5 — Endurecimiento y pruebas unitarias
 
-A partir de la revisión de robustez se añadieron:
-
 1. __Validación estricta de hex__ (`bigint_from_hex`): sin truncamiento silencioso.
-2. **Claves públicas canónicas**: rechazo de x ≥ p o y ≥ p, que antes pasaban la ecuación por reducción modular implícita.
-3. __Corrección de `bigint_inv_mod`__: entradas no invertibles producían un inverso falso (módulo par) o bucle infinito (p. ej. 3 mod 9); ahora se detecta y devuelve error.
-4. **SHA-256 KAT** y **18 pruebas unitarias de BigInt**, más casos borde de la API ECDSA.
+2. **Claves públicas canónicas**: rechazo de x ≥ p o y ≥ p.
+3. __Corrección de `bigint_inv_mod`__: entradas no invertibles producían un inverso falso o un bucle infinito.
+4. **SHA-256 KAT**, HMAC y pruebas unitarias de BigInt, más casos borde de la API.
+
+### Fase 6 — Mitigaciones de canal lateral y firma determinista
+
+1. `ec_point_cswap` + __escalera de Montgomery__ en `ec_scalar_mul` (256 iteraciones fijas).
+2. `bigint_cswap`, `bigint_exp_mod` (escalera de 256 iteraciones) y `bigint_inv_mod_fermat`.
+3. Inversión de Fermat aplicada a k⁻¹ en la firma (dato secreto).
+4. `hmac_sha256` y `ecdsa_sign` con __RFC 6979__, con `bits2octets` y borrado seguro de buffers.
+5. Vectores nuevos: RFC 4231 (HMAC) y RFC 6979 (firma determinista de P-256/SHA-256).
 
 ### Problemas encontrados y decisiones
 
@@ -228,7 +277,10 @@ A partir de la revisión de robustez se añadieron:
 | Inverso inexistente en el algoritmo binario | Guardas de módulo par y de u/v nulos |
 | Hex demasiado largo | Error de validación, nunca truncamiento |
 | Clave no canónica | Chequeo de rango antes de la ecuación de curva |
-| Firma no determinista | Se acepta (FIPS permite k aleatorio); los KAT usan `ecdsa_sign_with_k` |
+| `cswap` del tutorial usaba 8 limbs | Corregido a `BIGINT_WORDS` (20 palabras) |
+| RFC 6979 sin reducir h mod n | Añadido `bits2octets` (e mod n) |
+| Fermat con módulo compuesto devolvía basura | Verificación k·res ≡ 1 y error si falla |
+| Inversión de Fermat en todo el campo es ~1000× más lenta | Se usa solo para k⁻¹; el campo mantiene B.2 |
 
 ---
 
@@ -238,15 +290,18 @@ A partir de la revisión de robustez se añadieron:
 |---|---|
 | `ec_init_p256(ECCurve *c)` | Carga p, a, b, G, n |
 | `ec_point_add` / `ec_point_double` | Operaciones de grupo |
-| `ec_scalar_mul(c, k, P, R)` | R = [k]P |
-| `ecdsa_generate_keypair(c, d, Q)` | d aleatorio y Q = [d]G |
+| `ec_scalar_mul(c, k, P, R)` | R = [k]P mediante escalera de Montgomery |
+| `ecdsa_generate_keypair(c, d, Q)` | d aleatorio (CSPRNG) y Q = [d]G |
 | `ecdsa_keygen(c, d, Q)` | Deriva Q de un d dado y valida |
-| `ecdsa_sign(c, d, e, sig)` | Firma con k aleatorio |
-| `ecdsa_sign_with_k(c, d, e, k, sig)` | Firma con k fijo (CAVP) |
+| `ecdsa_sign(c, d, e, sig)` | Firma determinista con k de RFC 6979 |
+| `ecdsa_sign_with_k(c, d, e, k, sig)` | Firma con k explícito (CAVP) |
 | `ecdsa_verify(c, Q, e, sig)` | Verificación completa |
 | `ecdsa_point_is_on_curve(c, P)` | Pertenencia + canonicidad |
 | `sha256_hash` / `sha256_to_bigint` | Digest y conversión a entero |
-| `bigint_inv_mod`, `bigint_random_range` | Soporte criptográfico |
+| `hmac_sha256` | HMAC-SHA256 (RFC 2104) |
+| `bigint_inv_mod` / `bigint_inv_mod_fermat` | Inversos: binario B.2 / Fermat |
+| `bigint_exp_mod` | Exponenciación modular en escalera |
+| `bigint_random_range` | Muestreo uniforme para claves |
 
 ---
 
@@ -256,7 +311,7 @@ A partir de la revisión de robustez se añadieron:
 make all                                   # librería + tests + CLI
 ./build/test_ecdsa                         # banco de pruebas
 ./build/ecdsa_cli keygen                   # par de claves (d, Qx, Qy)
-./build/ecdsa_cli sign    <d> <mensaje>    # firma (r, s)
+./build/ecdsa_cli sign    <d> <mensaje>    # firma (r, s) determinista
 ./build/ecdsa_cli verify  <Qx> <Qy> <r> <s> <mensaje>
 ```
 
@@ -266,8 +321,8 @@ El entorno de compilación es Linux/WSL o MinGW/GCC; en Windows sin toolchain PO
 
 ## 9. Limitaciones y alcance didáctico
 
-- **No constant-time:** las operaciones usan ramas dependientes de bits (`double-and-add`) y comparaciones tempranas; no es apto para producción frente a ataques de canal lateral.
-- **Sin zeroización:** d, k y buffers de entropía no se limpian explícitamente de la pila.
-- **k aleatorio (RBG)** en lugar de RFC 6979; la firma no es reproducible entre ejecuciones (por diseño).
+- __Constant-time parcial:__ la escalera y los intercambios eliminan ramas dependientes del escalar, pero `ec_point_add`/`ec_point_double` siguen ramificando por `is_infinity`, `y == 0` y `x1 == x2`, y `bigint_div` itera según el valor de los operandos. No sustituye a una librería endurecida (p. ej. con coordenadas proyectivas y reducción de Barrett).
+- __Zeroización limitada:__ `ecdsa_sign` borra sus buffers (V, K, d y h serializados, candidato k), pero la clave privada copiada por valor en la pila y otros temporales no se limpian.
 - **Solo P-256** y entradas hexadecimales: no hay serialización DER/ASN.1, PEM ni interoperabilidad directa con OpenSSL (no requerido por la especificación del proyecto).
 - El truncamiento de e a bitlen(n) no se implementa porque SHA-256 y n tienen ambos 256 bits (caso equivalente según FIPS 186-5 §6.4).
+- RFC 6979 fija la variante HMAC-SHA256; no se parametriza otra función hash.

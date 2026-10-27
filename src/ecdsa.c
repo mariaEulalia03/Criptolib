@@ -150,6 +150,44 @@ void ec_point_add(const ECCurve *curve, const ECPoint *P, const ECPoint *Q, ECPo
     R->is_infinity = 0;
 }
 
+/*
+ * Sobrescribe memoria sensible sin que el compilador pueda optimizarlo.
+ */
+static void secure_zero(void *ptr, size_t len) {
+    volatile uint8_t *p = (volatile uint8_t *)ptr;
+    while (len--) {
+        *p++ = 0;
+    }
+}
+
+/*
+ * Intercambio condicional de puntos sin ramas: con mask = 0xFFFFFFFF
+ * intercambia p1 y p2; con mask = 0 no altera nada.
+ */
+static void ec_point_cswap(ECPoint *p1, ECPoint *p2, uint32_t mask) {
+    for (int i = 0; i < BIGINT_WORDS; i++) {
+        uint32_t t = (p1->x.limbs[i] ^ p2->x.limbs[i]) & mask;
+        p1->x.limbs[i] ^= t;
+        p2->x.limbs[i] ^= t;
+
+        t = (p1->y.limbs[i] ^ p2->y.limbs[i]) & mask;
+        p1->y.limbs[i] ^= t;
+        p2->y.limbs[i] ^= t;
+    }
+
+    uint32_t t = ((uint32_t)p1->x.len ^ (uint32_t)p2->x.len) & mask;
+    p1->x.len = (int)((uint32_t)p1->x.len ^ t);
+    p2->x.len = (int)((uint32_t)p2->x.len ^ t);
+
+    t = ((uint32_t)p1->y.len ^ (uint32_t)p2->y.len) & mask;
+    p1->y.len = (int)((uint32_t)p1->y.len ^ t);
+    p2->y.len = (int)((uint32_t)p2->y.len ^ t);
+
+    t = ((uint32_t)p1->is_infinity ^ (uint32_t)p2->is_infinity) & mask;
+    p1->is_infinity = (int)((uint32_t)p1->is_infinity ^ t);
+    p2->is_infinity = (int)((uint32_t)p2->is_infinity ^ t);
+}
+
 void ec_scalar_mul(const ECCurve *curve, const BigInt k, const ECPoint *P, ECPoint *R) {
     if (bigint_is_zero(&k) || P->is_infinity) {
         R->is_infinity = 1;
@@ -158,25 +196,27 @@ void ec_scalar_mul(const ECCurve *curve, const BigInt k, const ECPoint *P, ECPoi
         return;
     }
 
-    ECPoint acc;
-    acc.is_infinity = 1;
-    bigint_zero(&acc.x);
-    bigint_zero(&acc.y);
+    /*
+     * Escalera de Montgomery: en cada iteracion se ejecuta exactamente una
+     * adicion y una duplicacion, sin ramas que dependan del bit de k.
+     * Se recorren siempre 256 bits para no filtrar la longitud del escalar.
+     */
+    ECPoint r0, r1;
+    r0.is_infinity = 1;
+    bigint_zero(&r0.x);
+    bigint_zero(&r0.y);
+    r1 = *P;
 
-    int bit_len = bigint_bit_length(&k);
-    for (int i = bit_len - 1; i >= 0; i--) {
-        if (!acc.is_infinity) {
-            ec_point_double(curve, &acc, &acc);
-        }
-        if (bigint_get_bit(&k, i)) {
-            if (acc.is_infinity) {
-                acc = *P;
-            } else {
-                ec_point_add(curve, &acc, P, &acc);
-            }
-        }
+    for (int i = 255; i >= 0; i--) {
+        uint32_t mask = 0U - (uint32_t)bigint_get_bit(&k, i);
+
+        ec_point_cswap(&r0, &r1, mask);
+        ec_point_add(curve, &r0, &r1, &r1); /* r1 = r0 + r1 */
+        ec_point_double(curve, &r0, &r0);   /* r0 = 2 * r0 */
+        ec_point_cswap(&r0, &r1, mask);
     }
-    *R = acc;
+
+    *R = r0;
 }
 
 int ecdsa_keygen(const ECCurve *curve, BigInt priv_d, ECPoint *pub_Q) {
@@ -227,9 +267,9 @@ int ecdsa_sign_with_k(const ECCurve *curve, const BigInt priv_d, const BigInt ha
     bigint_mod(&r, &kG.x, &curve->n);
     if (bigint_is_zero(&r)) return 0;
 
-    /* k^(-1) mod n */
+    /* k^(-1) mod n: k es secreto, se usa la exponenciacion en escalera */
     BigInt k_inv;
-    if (!bigint_inv_mod(&k_inv, &k, &curve->n)) return 0;
+    if (!bigint_inv_mod_fermat(&k_inv, &k, &curve->n)) return 0;
 
     /* s = k^(-1) * (e + d*r) mod n */
     BigInt dr, sum_e_dr, s;
@@ -243,20 +283,86 @@ int ecdsa_sign_with_k(const ECCurve *curve, const BigInt priv_d, const BigInt ha
     return 1;
 }
 
+/*
+ * Generacion determinista de k segun RFC 6979 (seccion 3.2), con
+ * HMAC-SHA256 e int2octets/bits2octets sobre el orden n de la curva.
+ * Elimina la dependencia del CSPRNG en la firma: mismo (d, mensaje)
+ * produce siempre la misma (r, s).
+ */
 int ecdsa_sign(const ECCurve *curve, const BigInt priv_d, const BigInt hash_e, ECDSASignature *sig) {
-    BigInt one, n_minus_1, k;
+    uint8_t V[32];
+    uint8_t K[32];
+    uint8_t buf[97]; /* V || 0x00/0x01 || d_octets || h_octets */
+    uint8_t d_bytes[32];
+    uint8_t h_octets[32];
+
+    BigInt h_mod, k_candidate, one, n_minus_1;
+    int ok = 0;
+
+    /*
+     * RFC 6979 §2.3.2: bits2octets(H(m)) = int2octets(bits2int(H(m)) mod n).
+     * Con SHA-256 y P-256 ambos son de 256 bits, por lo que basta reducir mod n.
+     */
+    bigint_mod(&h_mod, &hash_e, &curve->n);
+    bigint_to_bytes(&priv_d, d_bytes, sizeof(d_bytes));
+    bigint_to_bytes(&h_mod, h_octets, sizeof(h_octets));
+
+    /* Paso a y b: V = 0x01..., K = 0x00... */
+    memset(V, 0x01, sizeof(V));
+    memset(K, 0x00, sizeof(K));
+
+    /* Paso c: K = HMAC_K(V || 0x00 || int2octets(d) || bits2octets(h)) */
+    memcpy(buf, V, 32);
+    buf[32] = 0x00;
+    memcpy(buf + 33, d_bytes, 32);
+    memcpy(buf + 65, h_octets, 32);
+    hmac_sha256(K, sizeof(K), buf, sizeof(buf), K);
+
+    /* Paso d: V = HMAC_K(V) */
+    hmac_sha256(K, sizeof(K), V, sizeof(V), V);
+
+    /* Paso e: K = HMAC_K(V || 0x01 || int2octets(d) || bits2octets(h)) */
+    memcpy(buf, V, 32);
+    buf[32] = 0x01;
+    memcpy(buf + 33, d_bytes, 32);
+    memcpy(buf + 65, h_octets, 32);
+    hmac_sha256(K, sizeof(K), buf, sizeof(buf), K);
+
+    /* Paso f: V = HMAC_K(V) */
+    hmac_sha256(K, sizeof(K), V, sizeof(V), V);
+
     bigint_set_u32(&one, 1);
     bigint_sub(&n_minus_1, &curve->n, &one);
 
-    for (int attempts = 0; attempts < 1000; attempts++) {
-        if (!bigint_random_range(&k, &one, &n_minus_1)) {
-            return 0;
+    /* Paso h: candidatos k = bits2int(V) mientras no se obtenga firma valida */
+    for (int attempts = 0; attempts < 100 && !ok; attempts++) {
+        hmac_sha256(K, sizeof(K), V, sizeof(V), V);
+        bigint_from_bytes(&k_candidate, V, sizeof(V));
+
+        if (bigint_cmp(&k_candidate, &one) >= 0 &&
+            bigint_cmp(&k_candidate, &n_minus_1) <= 0) {
+            if (ecdsa_sign_with_k(curve, priv_d, hash_e, k_candidate, sig)) {
+                ok = 1;
+            }
         }
-        if (ecdsa_sign_with_k(curve, priv_d, hash_e, k, sig)) {
-            return 1;
+
+        if (!ok) {
+            /* K = HMAC_K(V || 0x00); V = HMAC_K(V) */
+            memcpy(buf, V, 32);
+            buf[32] = 0x00;
+            hmac_sha256(K, sizeof(K), buf, 33, K);
+            hmac_sha256(K, sizeof(K), V, sizeof(V), V);
         }
     }
-    return 0;
+
+    secure_zero(V, sizeof(V));
+    secure_zero(K, sizeof(K));
+    secure_zero(buf, sizeof(buf));
+    secure_zero(d_bytes, sizeof(d_bytes));
+    secure_zero(h_octets, sizeof(h_octets));
+    secure_zero(&k_candidate, sizeof(k_candidate));
+
+    return ok;
 }
 
 int ecdsa_verify(const ECCurve *curve, const ECPoint *pub_Q, const BigInt hash_e, const ECDSASignature *sig) {

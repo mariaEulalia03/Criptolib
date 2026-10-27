@@ -60,6 +60,16 @@ void bigint_mul_mod(BigInt *res, const BigInt *a, const BigInt *b, const BigInt 
 /* Inverso modular NIST B.2 (requiere modulo impar y mcd(k, m) == 1) */
 int  bigint_inv_mod(BigInt *res, const BigInt *k, const BigInt *m);
 
+/* Exponenciacion modular res = base^exp mod m (escalera de Montgomery, 256 bits) */
+void bigint_exp_mod(BigInt *res, const BigInt *base, const BigInt *exp, const BigInt *m);
+
+/*
+ * Inverso modular por Pequeno Teorema de Fermat: res = k^(m-2) mod m.
+ * Valido para modulo primo (p y n en P-256). Verifica k*res == 1 (mod m)
+ * y devuelve 0 si no existe inverso.
+ */
+int  bigint_inv_mod_fermat(BigInt *res, const BigInt *k, const BigInt *m);
+
 /* Generacion Aleatoria Criptografica en Rango [min, max] */
 int bigint_random_range(BigInt *out, const BigInt *min, const BigInt *max);
 
@@ -79,6 +89,11 @@ void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len);
 void sha256_final(sha256_ctx *ctx, uint8_t hash[32]);
 void sha256_hash(const uint8_t *data, size_t len, uint8_t hash[32]);
 void sha256_to_bigint(const uint8_t hash[32], BigInt *out);
+
+/* HMAC-SHA256 (RFC 2104) */
+void hmac_sha256(const uint8_t *key, size_t key_len,
+                 const uint8_t *data, size_t data_len,
+                 uint8_t out[32]);
 
 /* Entropia del Sistema */
 int cryptolib_random_bytes(uint8_t *buf, size_t len);
