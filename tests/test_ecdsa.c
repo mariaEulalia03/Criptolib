@@ -29,6 +29,195 @@ static void print_hex_label(const char *label, const BigInt *val) {
     printf("    %s: 0x%s\n", label, hex);
 }
 
+/* Conversion de bytes a cadena hexadecimal mayuscula (con ceros a la izquierda) */
+static void bytes_to_hex(const uint8_t *bytes, size_t len, char *out) {
+    static const char *digits = "0123456789ABCDEF";
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2]     = digits[(bytes[i] >> 4) & 0xF];
+        out[i * 2 + 1] = digits[bytes[i] & 0xF];
+    }
+    out[len * 2] = '\0';
+}
+
+/* ========================================================================= */
+/*                    FASE 0: PRUEBAS UNITARIAS DE SHA-256                   */
+/* ========================================================================= */
+
+static void test_sha256_kat(void) {
+    printf("\n%s=== FASE 0: Vectores de Prueba SHA-256 (FIPS 180-4) ===%s\n", COLOR_CYAN, COLOR_RESET);
+
+    struct {
+        const char *msg;
+        const char *expected;
+    } vectors[] = {
+        {"", "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"},
+        {"abc", "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"},
+        {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+         "248D6A61D20638B8E5C026930C3E6039A33CE45964FF2167F6ECEDD419DB06C1"},
+        {"The quick brown fox jumps over the lazy dog",
+         "D7A8FBB307D7809469CA9ABCB0082E4F8D5651E46D3CDB762D02D0BF37C9E592"},
+    };
+
+    size_t n_vectors = sizeof(vectors) / sizeof(vectors[0]);
+    for (size_t i = 0; i < n_vectors; i++) {
+        uint8_t hash[32];
+        char hex[65];
+        char name[160];
+
+        sha256_hash((const uint8_t *)vectors[i].msg, strlen(vectors[i].msg), hash);
+        bytes_to_hex(hash, sizeof(hash), hex);
+
+        snprintf(name, sizeof(name), "SHA-256 KAT: \"%s\"",
+                 (vectors[i].msg[0] != '\0') ? vectors[i].msg : "(cadena vacia)");
+        assert_condition(strcmp(hex, vectors[i].expected) == 0, name);
+    }
+
+    /* El procesamiento incremental en varios bloques debe dar el mismo digest */
+    const char *msg = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    uint8_t one_shot[32], incremental[32];
+    char hex_one_shot[65], hex_incremental[65];
+    sha256_ctx ctx;
+
+    sha256_hash((const uint8_t *)msg, strlen(msg), one_shot);
+    sha256_init(&ctx);
+    sha256_update(&ctx, (const uint8_t *)msg, 7);
+    sha256_update(&ctx, (const uint8_t *)msg + 7, strlen(msg) - 7);
+    sha256_final(&ctx, incremental);
+
+    bytes_to_hex(one_shot, sizeof(one_shot), hex_one_shot);
+    bytes_to_hex(incremental, sizeof(incremental), hex_incremental);
+    assert_condition(strcmp(hex_one_shot, hex_incremental) == 0,
+                     "SHA-256: procesamiento incremental coincide con sha256_hash");
+}
+
+/* ========================================================================= */
+/*                    FASE 0: PRUEBAS UNITARIAS DE BigInt                    */
+/* ========================================================================= */
+
+static void test_bigint_unit(const ECCurve *curve) {
+    printf("\n%s=== FASE 0: Pruebas Unitarias de Aritmetica BigInt ===%s\n", COLOR_CYAN, COLOR_RESET);
+
+    BigInt a, b, res, q, rem, check, prod;
+    char hex[256];
+
+    /* Suma con acarreo entre palabras */
+    bigint_from_hex(&a, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+    bigint_from_hex(&b, "1");
+    bigint_add(&res, &a, &b);
+    bigint_to_hex(&res, hex, sizeof(hex));
+    assert_condition(strcmp(hex, "100000000000000000000000000000000") == 0,
+                     "BigInt: suma propaga el acarreo entre palabras");
+
+    /* Resta que revierte la suma */
+    bigint_sub(&res, &res, &b);
+    bigint_to_hex(&res, hex, sizeof(hex));
+    assert_condition(strcmp(hex, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF") == 0,
+                     "BigInt: resta recupera el valor original");
+
+    /* Resta con resultado negativo debe rechazarse */
+    assert_condition(bigint_sub(&res, &b, &a) == -1,
+                     "BigInt: resta con minuendo menor es rechazada (a >= b)");
+
+    /* Multiplicacion 64 x 64 -> 128 bits */
+    bigint_from_hex(&a, "FFFFFFFFFFFFFFFF");
+    bigint_mul(&res, &a, &a);
+    bigint_to_hex(&res, hex, sizeof(hex));
+    assert_condition(strcmp(hex, "FFFFFFFFFFFFFFFE0000000000000001") == 0,
+                     "BigInt: multiplicacion de 64 x 64 bits es exacta");
+
+    /* Division: a = q * b + r con 0 <= r < b */
+    bigint_from_hex(&a, "123456789ABCDEF0123456789ABCDEF0");
+    bigint_from_hex(&b, "100000000");
+    bigint_div(&q, &rem, &a, &b);
+    bigint_mul(&prod, &q, &b);
+    bigint_add(&check, &prod, &rem);
+    assert_condition(bigint_cmp(&check, &a) == 0 && bigint_cmp(&rem, &b) < 0,
+                     "BigInt: division cumple a = q*b + r con r < b");
+
+    /* Modulo coincide con el resto de la division */
+    bigint_mod(&res, &a, &b);
+    assert_condition(bigint_cmp(&res, &rem) == 0,
+                     "BigInt: modulo coincide con el resto de la division");
+
+    /* Inverso modular existente: 7^-1 mod 13 = 2 */
+    bigint_set_u32(&a, 7);
+    bigint_set_u32(&b, 13);
+    int inv_ok = bigint_inv_mod(&res, &a, &b);
+    bigint_to_hex(&res, hex, sizeof(hex));
+    assert_condition(inv_ok && strcmp(hex, "2") == 0,
+                     "BigInt: inverso modular 7^-1 mod 13 = 2");
+
+    /* Inverso modular inexistente: 2 no es invertible mod 4 (modulo par) */
+    bigint_set_u32(&a, 2);
+    bigint_set_u32(&b, 4);
+    assert_condition(bigint_inv_mod(&res, &a, &b) == 0 && bigint_is_zero(&res),
+                     "BigInt: inverso modular inexistente devuelve error (modulo par)");
+
+    /* Inverso modular inexistente con modulo impar: 3 no es invertible mod 9 */
+    bigint_set_u32(&a, 3);
+    bigint_set_u32(&b, 9);
+    assert_condition(bigint_inv_mod(&res, &a, &b) == 0 && bigint_is_zero(&res),
+                     "BigInt: inverso modular inexistente devuelve error (mcd > 1)");
+
+    /* Desplazamientos ida y vuelta */
+    bigint_set_u32(&a, 1);
+    bigint_shift_left(&a, &a, 130);
+    bigint_shift_right(&a, &a, 130);
+    bigint_to_hex(&a, hex, sizeof(hex));
+    assert_condition(strcmp(hex, "1") == 0,
+                     "BigInt: desplazamientos izquierda/derecha son reversibles");
+
+    /* Conversion bytes <-> BigInt reversible */
+    uint8_t bytes_in[32], bytes_out[32];
+    for (int i = 0; i < 32; i++) bytes_in[i] = (uint8_t)(0xA0 + i);
+    bigint_from_bytes(&a, bytes_in, sizeof(bytes_in));
+    bigint_to_bytes(&a, bytes_out, sizeof(bytes_out));
+    assert_condition(memcmp(bytes_in, bytes_out, sizeof(bytes_in)) == 0,
+                     "BigInt: conversion bytes <-> BigInt es reversible");
+
+    /* Parseo hexadecimal: prefijo 0x y mayusculas/minusculas */
+    int parsed_0x = bigint_from_hex(&a, "0xDeadBeef");
+    bigint_to_hex(&a, hex, sizeof(hex));
+    assert_condition(parsed_0x == 0 && strcmp(hex, "DEADBEEF") == 0,
+                     "BigInt: parseo hexadecimal con prefijo 0x");
+
+    /* Entradas invalidas: caracter no hexadecimal, cadena vacia y desbordamiento */
+    assert_condition(bigint_from_hex(&a, "12ZZ") == -1 && bigint_is_zero(&a),
+                     "BigInt: hex con caracter invalido es rechazado");
+    assert_condition(bigint_from_hex(&a, "") == -1 && bigint_is_zero(&a),
+                     "BigInt: cadena hexadecimal vacia es rechazada");
+
+    char big_hex[163];
+    big_hex[0] = '1';
+    memset(big_hex + 1, '0', 160);
+    big_hex[161] = '\0'; /* 161 digitos = 644 bits > capacidad */
+    assert_condition(bigint_from_hex(&a, big_hex) == -1 && bigint_is_zero(&a),
+                     "BigInt: hex de mas de 640 bits es rechazado (sin truncamiento)");
+
+    memset(big_hex, 'F', 160);
+    big_hex[160] = '\0'; /* 160 digitos = 640 bits exactos */
+    assert_condition(bigint_from_hex(&a, big_hex) == 0 && bigint_bit_length(&a) == 640,
+                     "BigInt: hex de 160 digitos (640 bits) es aceptado");
+
+    /* Muestreo aleatorio acotado al rango [1, n-1] */
+    BigInt one, n_minus_1, rnd;
+    bigint_set_u32(&one, 1);
+    bigint_sub(&n_minus_1, &curve->n, &one);
+
+    int in_range = 1;
+    for (int i = 0; i < 16; i++) {
+        if (!bigint_random_range(&rnd, &one, &n_minus_1) ||
+            bigint_cmp(&rnd, &one) < 0 || bigint_cmp(&rnd, &n_minus_1) > 0) {
+            in_range = 0;
+            break;
+        }
+    }
+    assert_condition(in_range, "BigInt: muestreo aleatorio en [1, n-1] respeta el rango");
+
+    assert_condition(bigint_random_range(&rnd, &one, &one) && bigint_is_one(&rnd),
+                     "BigInt: rango degenerado [1, 1] devuelve el limite");
+}
+
 /* ========================================================================= */
 /*                          FASE 1 Y 2: CONTROL DE CURVA                     */
 /* ========================================================================= */
@@ -186,6 +375,80 @@ void test_fase4_flujo_completo(const ECCurve *curve) {
     assert_condition(!verify_corrupted, "Deteccion de firma adulterada (s modificado) fue RECHAZADA");
 }
 
+/* ========================================================================= */
+/*          FASE 5: VALIDACION CANONICA Y CASOS BORDE DE LA API              */
+/* ========================================================================= */
+
+void test_validaciones_borde(const ECCurve *curve) {
+    printf("\n%s=== FASE 5: Validacion Canonica y Casos Borde ===%s\n", COLOR_CYAN, COLOR_RESET);
+
+    /* Firma valida de referencia */
+    BigInt priv_d;
+    ECPoint pub_Q;
+    ecdsa_generate_keypair(curve, &priv_d, &pub_Q);
+
+    const char *mensaje = "Validacion canonica de clave publica";
+    uint8_t hash_bytes[32];
+    sha256_hash((const uint8_t *)mensaje, strlen(mensaje), hash_bytes);
+
+    BigInt hash_e;
+    sha256_to_bigint(hash_bytes, &hash_e);
+
+    ECDSASignature firma;
+    ecdsa_sign(curve, priv_d, hash_e, &firma);
+
+    /* 1. Coordenada x no canonica: x' = x + p (se reduce a x mod p) */
+    ECPoint no_canonico_x = pub_Q;
+    bigint_add(&no_canonico_x.x, &pub_Q.x, &curve->p);
+    assert_condition(!ecdsa_point_is_on_curve(curve, &no_canonico_x),
+                     "Punto con x >= p es rechazado por la validacion canonica");
+    assert_condition(!ecdsa_verify(curve, &no_canonico_x, hash_e, &firma),
+                     "ecdsa_verify rechaza una clave publica no canonica (x + p)");
+
+    /* 2. Coordenada y no canonica: y' = y + p */
+    ECPoint no_canonico_y = pub_Q;
+    bigint_add(&no_canonico_y.y, &pub_Q.y, &curve->p);
+    assert_condition(!ecdsa_verify(curve, &no_canonico_y, hash_e, &firma),
+                     "ecdsa_verify rechaza una clave publica no canonica (y + p)");
+
+    /* 3. Componentes r y s fuera de [1, n-1] */
+    ECDSASignature sig_invalida = firma;
+    bigint_zero(&sig_invalida.r);
+    assert_condition(!ecdsa_verify(curve, &pub_Q, hash_e, &sig_invalida),
+                     "ecdsa_verify rechaza r = 0");
+
+    sig_invalida = firma;
+    bigint_zero(&sig_invalida.s);
+    assert_condition(!ecdsa_verify(curve, &pub_Q, hash_e, &sig_invalida),
+                     "ecdsa_verify rechaza s = 0");
+
+    sig_invalida = firma;
+    bigint_add(&sig_invalida.s, &firma.s, &curve->n); /* s' = s + n >= n */
+    assert_condition(!ecdsa_verify(curve, &pub_Q, hash_e, &sig_invalida),
+                     "ecdsa_verify rechaza s fuera del rango [1, n-1]");
+
+    /* 4. Claves privadas invalidas en keygen */
+    BigInt d_invalida;
+    ECPoint Q_tmp;
+    Q_tmp.is_infinity = 1;
+
+    bigint_zero(&d_invalida);
+    assert_condition(!ecdsa_keygen(curve, d_invalida, &Q_tmp),
+                     "ecdsa_keygen rechaza d = 0");
+
+    bigint_copy(&d_invalida, &curve->n);
+    assert_condition(!ecdsa_keygen(curve, d_invalida, &Q_tmp),
+                     "ecdsa_keygen rechaza d = n");
+
+    /* 5. Clave publica en el infinito */
+    ECPoint infinito;
+    infinito.is_infinity = 1;
+    bigint_zero(&infinito.x);
+    bigint_zero(&infinito.y);
+    assert_condition(!ecdsa_verify(curve, &infinito, hash_e, &firma),
+                     "ecdsa_verify rechaza la clave publica en el infinito");
+}
+
 int main(void) {
     printf("%s=================================================================%s\n", COLOR_BOLD, COLOR_RESET);
     printf("%s   CRYPTOLIB: BANCO DE PRUEBAS DE VALIDACION DEL ESTANDAR ECDSA  %s\n", COLOR_BOLD, COLOR_RESET);
@@ -195,9 +458,12 @@ int main(void) {
     ECCurve curve;
     ec_init_p256(&curve);
 
+    test_sha256_kat();
+    test_bigint_unit(&curve);
     test_fase1_y_2_arimetica(&curve);
     test_fase3_vectores_cavp(&curve);
     test_fase4_flujo_completo(&curve);
+    test_validaciones_borde(&curve);
 
     printf("\n%s-----------------------------------------------------------------%s\n", COLOR_BOLD, COLOR_RESET);
     printf("RESUMEN DE PRUEBAS:\n");

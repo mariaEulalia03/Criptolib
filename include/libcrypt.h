@@ -57,7 +57,8 @@ void bigint_mod(BigInt *res, const BigInt *a, const BigInt *m);
 void bigint_add_mod(BigInt *res, const BigInt *a, const BigInt *b, const BigInt *m);
 void bigint_sub_mod(BigInt *res, const BigInt *a, const BigInt *b, const BigInt *m);
 void bigint_mul_mod(BigInt *res, const BigInt *a, const BigInt *b, const BigInt *m);
-int  bigint_inv_mod(BigInt *res, const BigInt *k, const BigInt *m); /* Inverso modular NIST B.2 */
+/* Inverso modular NIST B.2 (requiere modulo impar y mcd(k, m) == 1) */
+int  bigint_inv_mod(BigInt *res, const BigInt *k, const BigInt *m);
 
 /* Generacion Aleatoria Criptografica en Rango [min, max] */
 int bigint_random_range(BigInt *out, const BigInt *min, const BigInt *max);

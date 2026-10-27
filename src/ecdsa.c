@@ -25,6 +25,15 @@ void ec_init_p256(ECCurve *curve) {
 int ecdsa_point_is_on_curve(const ECCurve *curve, const ECPoint *P) {
     if (P->is_infinity) return 1;
 
+    /*
+     * Validacion canonica: las coordenadas deben pertenecer al campo F_p,
+     * es decir 0 <= x,y < p. Sin este chequeo un punto con x o y >= p
+     * pasaria la ecuacion tras la reduccion modular implicita, aceptando
+     * claves publicas no canonicas.
+     */
+    if (bigint_cmp(&P->x, &curve->p) >= 0) return 0;
+    if (bigint_cmp(&P->y, &curve->p) >= 0) return 0;
+
     /* Verifica lhs = y^2 mod p */
     BigInt lhs;
     bigint_mul_mod(&lhs, &P->y, &P->y, &curve->p);

@@ -353,6 +353,16 @@ int bigint_inv_mod(BigInt *res, const BigInt *k, const BigInt *m) {
         return 0;
     }
 
+    /*
+     * El algoritmo binario de NIST B.2 asume modulo IMPAR (siempre cierto en
+     * P-256, donde p y n son primos impares). Con modulo par la division
+     * (x + m) / 2 no es exacta y el resultado seria incorrecto.
+     */
+    if (bigint_is_even(m)) {
+        bigint_zero(res);
+        return 0;
+    }
+
     BigInt u, v, x1, x2;
     bigint_copy(&u, k);
     bigint_copy(&v, m);
@@ -360,6 +370,12 @@ int bigint_inv_mod(BigInt *res, const BigInt *k, const BigInt *m) {
     bigint_zero(&x2);
 
     while (!bigint_is_one(&u) && !bigint_is_one(&v)) {
+        /* Si u o v llegan a cero, mcd(k, m) > 1: el inverso no existe */
+        if (bigint_is_zero(&u) || bigint_is_zero(&v)) {
+            bigint_zero(res);
+            return 0;
+        }
+
         while (bigint_is_even(&u)) {
             bigint_shift_right(&u, &u, 1);
             if (bigint_is_even(&x1)) {
@@ -412,7 +428,13 @@ int bigint_inv_mod(BigInt *res, const BigInt *k, const BigInt *m) {
     return 1;
 }
 
-/* Parseo desde cadena hexadecimal */
+/*
+ * Parseo desde cadena hexadecimal.
+ * Devuelve 0 en exito, -1 si la cadena es vacia, contiene un caracter
+ * no hexadecimal o excede la capacidad maxima (BIGINT_WORDS * 8 digitos).
+ * Ante cualquier error el BigInt de salida queda en cero, evitando que un
+ * valor truncado se use silenciosamente como clave o firma.
+ */
 int bigint_from_hex(BigInt *a, const char *hex_str) {
     bigint_init(a);
     if (!hex_str) return -1;
@@ -422,25 +444,38 @@ int bigint_from_hex(BigInt *a, const char *hex_str) {
         hex_str += 2;
     }
 
-    size_t len = strlen(hex_str);
-    while (len > 0 && isspace((unsigned char)*hex_str)) {
-        hex_str++;
-        len--;
-    }
+    const int max_digits = (int)(BIGINT_WORDS * 8);
+    int digits = 0;
 
-    for (size_t i = 0; i < len; i++) {
-        char c = hex_str[i];
-        int val = 0;
+    for (const char *p = hex_str; *p != '\0'; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isspace(c)) continue; /* Ignora espacios en blanco */
+
+        int val;
         if (c >= '0' && c <= '9') val = c - '0';
         else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
         else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
-        else if (isspace((unsigned char)c)) continue;
-        else return -1; /* Caracter invalido */
+        else { /* Caracter invalido */
+            bigint_zero(a);
+            return -1;
+        }
+
+        /* Rechaza desbordamiento en lugar de truncar los bits altos */
+        if (++digits > max_digits) {
+            bigint_zero(a);
+            return -1;
+        }
 
         bigint_shift_left(a, a, 4);
         a->limbs[0] |= (uint32_t)val;
         if (a->len == 0 && val != 0) a->len = 1;
     }
+
+    if (digits == 0) { /* Cadena vacia o solo espacios */
+        bigint_zero(a);
+        return -1;
+    }
+
     bigint_normalize(a);
     return 0;
 }
